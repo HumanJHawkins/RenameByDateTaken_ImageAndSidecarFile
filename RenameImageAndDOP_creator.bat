@@ -1,37 +1,38 @@
 @echo off
+setlocal enabledelayedexpansion
 
 REM Set the root directory
-set root=%1
-if not defined root set root=.
+set rootDirectory=%1
+if not defined rootDirectory set rootDirectory=.
 
 REM Create a new text file with the current date/time as its name
-for /f "delims=" %%a in ('wmic OS Get localdatetime  ^| find "."') do set dt=%%a
-set dt=%dt:~0,8%_%dt:~8,6%
-echo REM Created Script >> %dt%.txt
-echo Generated script: %dt%.txt
+for /f "delims=" %%a in ('wmic OS Get localdatetime  ^| find "."') do set currentDateTime=%%a
+set bulkRenameBatchFile=%currentDateTime:~0,8%_%currentDateTime:~8,6%.txt
+echo REM Created Script >> %bulkRenameBatchFile%
+echo Generated script: %bulkRenameBatchFile%
 
 REM Use ExifTool to generate the rename commands
-setlocal enabledelayedexpansion
-set /a counter=1
-set "LastComputedFilename="
-for /R "%root%" %%F in (*.*) do (
-    if /I "%%~xF" NEQ ".dop" (
-        for /f "delims=" %%i in ('exiftool -d "%%Y%%m%%d_%%H%%M%%S" -p "$DateTimeOriginal" "%%F" 2^>nul') do (
-            if "%%i" NEQ "" (
-                if "!LastComputedFilename!" EQU "%%i" (
-                    set /a counter+=1
-                ) else (
-                    set "LastComputedFilename=%%i"
-                    set counter=01
+for /R "%rootDirectory%" %%F in (*.*) do (
+    set "currentFile=%%F"
+    set "currentFileDir=%%~dpF"
+    set "currentFileName=%%~nF"
+    set "currentFileExtension=%%~xF"
+    
+    if /I "!currentFileExtension!" NEQ ".dop" (
+        for /f "delims=" %%i in ('exiftool -d "%%Y%%m%%d_%%H%%M%%S" -p "$DateTimeOriginal" "!currentFile!" 2^>nul') do (
+            set "currentFileDateTime=%%i"
+            if "!currentFileDateTime!" NEQ "" (
+                set "newFileNameWithExtension=!currentFileDateTime!_!currentFileName!!currentFileExtension!"
+                set "dopFile=!currentFile!.dop"
+                echo ren "!currentFile!" "!newFileNameWithExtension!" >> %bulkRenameBatchFile%
+                if exist "!dopFile!" (
+                    echo ren "!dopFile!" "!newFileNameWithExtension!.dop" >> %bulkRenameBatchFile%
                 )
-                echo ren "%%F" "%%i_!counter!%%~xF" >> %dt%.txt
-                echo ren "%%~dpnF.dop" "%%i_!counter!.dop" >> %dt%.txt
             ) else (
-                echo Error reading DateTimeOriginal from "%%F" >&2
+                echo Error reading DateTimeOriginal from "!currentFile!" >&2
             )
         )
     )
 )
-
 echo Done.
 endlocal
