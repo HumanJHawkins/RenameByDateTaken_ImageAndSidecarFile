@@ -1,136 +1,177 @@
 # Load the required .NET assembly
 Add-Type -AssemblyName System.Windows.Forms
 
-# Create an instance of FolderBrowserDialog
-$startPath = "P:\01_Photo_Production\_TempRenameInProgress\"
+# A logging function:
+function LogOutput ($textToOutput) {
+    Add-Content -Path "$rootDirectory\$logFile" -Value $textToOutput
+    Write-Output $textToOutput
+}
+
+# Get folder to operate on:
+$defaultPath = "P:\01_Photo_Production\_TempRenameInProgress\"
 $folderBrowserDialog = New-Object -TypeName System.Windows.Forms.FolderBrowserDialog
-$folderBrowserDialog.SelectedPath = $startPath
+$folderBrowserDialog.SelectedPath = $defaultPath
 $folderBrowserDialog.Description = "Select a folder"
 
-# Show the folder selection dialog
-$dialogResult = $folderBrowserDialog.ShowDialog()
-
-# Dialog Result Processing
-# Check if the user clicked "OK" and get the selected path
-if ($dialogResult -eq [System.Windows.Forms.DialogResult]::OK) {
-    $rootDirectory = $folderBrowserDialog.SelectedPath
-}
-else {
+if (!($folderBrowserDialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK)) {
+    Write-Output "Folder selection cancelled. Exiting."
+    exit
+} elseif ([string]::IsNullOrEmpty($folderBrowserDialog.SelectedPath)) {
+    Write-Output "Invalid (Null or Empty) folder selection. Exiting."
     exit
 }
 
-# User Input Validation
-# If user cancels the folder selection, exit the script
-if ([string]::IsNullOrEmpty($rootDirectory)) {
-    Write-Output "No folder selected, exiting..."
-    exit
-}
+$rootDirectory = $folderBrowserDialog.SelectedPath
 
-# Count total files
-$totalFiles = (Get-ChildItem -File -Recurse $rootDirectory | Measure-Object).Count
-Write-Output "Directory to process: $rootDirectory"
-Write-Output "Total files to process: $totalFiles"
+# Initialize log file and variables
+LogOutput "Log file created at $currentTime"
+LogOutput "Root directory selected: $rootDirectory"
 
-# Initialize variables
-$fileCount = 0
-$imageFileCount = 0
-$dopFileCount = 0
-$imageFilesRenamed = 0
-$dopFilesRenamed = 0
-$skippedFileCount = 0
+
+$totalFiles = (Get-ChildItem -Path $rootDirectory -File -Recurse).Count
+$statusUpdateIntervalSeconds = 5
+
 $currentTime = Get-Date
-$lastOutputTime = $currentTime
-$lastGcTime = $currentTime
+$lastStatusUpdateTime = $currentTime
 $logFile = "RenameLog_$($currentTime.ToString('yyyyMMdd_HHmmss')).txt"
+$deleteScriptFile = "DeleteOrphanedDOPs_$($currentTime.ToString('yyyyMMdd_HHmmss')).txt"
 
-# Initialize log file
-Add-Content -Path "$rootDirectory\$logFile" -Value "Log file created at $currentTime"
 
-# Main Processing - Files Iteration
-Get-ChildItem -File -Recurse $rootDirectory | ForEach-Object {
-    try {
-        $currentFile = $_.FullName
-        $currentFileName = $_.BaseName
-        $currentFileExtension = $_.Extension.ToLower()
+# Preprocess all files. Since we may be dealing with .dop sidecar
+#  files that need to be kept in sync, analyze everything first. 
+$fileInfoList = @()
+Get-ChildItem -Path $rootDirectory -File -Recurse | ForEach-Object {
+    # Store file information
+    $fileName = $_.BaseName
+    $fileExtension = $_.Extension
+    $isDatePrefixed = $fileName -match '^\d{8}_\d{2}_'
 
-        # Pre-processing: File naming adjustments
-        if ($_.Extension -ne $currentFileExtension) {
-            Rename-Item -Path $currentFile -NewName ($_.BaseName + $currentFileExtension)
-        }
+    # Presume the usual corresponding filename. If not actually present, revert to null.
+    $correspondingFileName = if ($fileExtension -eq ".dop") { 
+        # Remove only the last occurrence of .dop
+        $fileName -replace '\.dop$', ''
+    } else {
+        $fileName + $fileExtension + ".dop"
+    }
 
-        if ($currentFileName -like "IMG_*") {
-            $newFileName = $currentFileName -replace "^IMG_", ""
-            Rename-Item -Path $currentFile -NewName ($newFileName + $currentFileExtension)
-            $currentFileName = $newFileName
-        }
+    if(!(Test-Path -Path "$($_.DirectoryName)\$correspondingFileName")) {
+        $correspondingFileName = $null
+    }
 
-        if ($currentFileExtension -ne ".dop") {
-            $exiftoolOutput = & exiftool.exe -d "%Y%m%d_%H%M%S" -DateTimeOriginal $currentFile 2>$null
-            if (!$exiftoolOutput) {
-                $skippedFileCount++
-                Add-Content -Path "$rootDirectory\$logFile" -Value "Skipped (ExifTool output not found): $currentFile"
-                throw "ExifTool output not found"
+
+    $fileInfo = New-Object -TypeName PSObject -Property @{
+        FullPathName = $_.FullName
+        FileName = $fileName
+        FileExtension = $fileExtension
+        IsSidecarFile = $fileExtension -eq ".dop"
+        DateTimeTaken = $null
+        DateTimeTakenIsValid = $false
+        IsDatePrefixed = $isDatePrefixed
+        FilenameAlreadyValid = $isDatePrefixed
+        CorrespondingFileName = $correspondingFileName
+    }
+
+    # If it's an image file, get the DateTimeTaken
+    if (!$fileInfo.IsSidecarFile) {
+        try {
+            $exiftoolOutput = & exiftool.exe -d "%Y%m%d_%H%M%S" -DateTimeOriginal $_.FullName 2>$null
+            if ($exiftoolOutput) {
+                $dateTime = $exiftoolOutput -replace '.*: '
+                $fileInfo.DateTimeTaken = $dateTime
+                $dummy = New-Object DateTime
+                $fileInfo.DateTimeTakenIsValid = [DateTime]::TryParseExact($dateTime, "yyyyMMdd_HHmmss", [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::None, [ref]$dummy)
+
+                if (!$fileInfo.DateTimeTakenIsValid -and ![string]::IsNullOrEmpty($dateTime)) {
+                    # Log the DateTimeTaken extraction and validation result
+                    $logMessage = "Invalid DateTimeTaken `"$dateTime`" extracted from `"$($_.FullName)`"."
+                    LogOutput $logMessage
+                }
             } else {
-                $currentFileDateTime = $exiftoolOutput.Split(":")[1].Trim()
-                if ($currentFileDateTime.Length -ne 15) {
-                    $skippedFileCount++
-                    Add-Content -Path "$rootDirectory\$logFile" -Value "Skipped (Invalid DateTime length): $currentFile"
-                    throw "Invalid DateTime length"
-                }
-
-                $currentFileDateHour = $currentFileDateTime.Substring(0,11)
-                if ($currentFileName -notlike "*$currentFileDateHour*") {
-                    $newFileNameWithExtension = "$currentFileDateTime" + "_" + $currentFileName + $currentFileExtension
-                    Rename-Item -Path $currentFile -NewName $newFileNameWithExtension
-                    $imageFilesRenamed++
-
-                    $dopFile = $currentFile + ".dop"
-                    if (Test-Path $dopFile) {
-                        $newDopFileName = "$currentFileDateTime" + "_" + $currentFileName + $currentFileExtension + ".dop"
-                        Rename-Item -Path $dopFile -NewName $newDopFileName
-                        $dopFilesRenamed++
-                    }
-                }
-                $imageFileCount++
-                Add-Content -Path "$rootDirectory\$logFile" -Value "Handled: $currentFile"
-            }
-            $currentTime = Get-Date
-            if (($currentTime - $lastOutputTime).TotalSeconds -gt 3) {
-                $statusMessage = "$fileCount out of $totalFiles files processed..."
-                Write-Output $statusMessage
-                Add-Content -Path "$rootDirectory\$logFile" -Value $statusMessage
-                $lastOutputTime = Get-Date
+                # Log if no exif data found
+                $logMessage = "No DateTimeTaken found for `"$($_.FullName)`""
+                LogOutput $logMessage
             }
         }
-        else {
-            $dopFileCount++
-            Add-Content -Path "$rootDirectory\$logFile" -Value "Not acted upon: $currentFile"
-        }
-        $fileCount++
-        if (($currentTime - $lastGcTime).TotalMinutes -gt 5) {
-            [GC]::Collect()
-            $lastGcTime = Get-Date
+        catch {
+            $errorMessage = "Error retrieving DateTimeTaken for `"$($_.FullName)`": $_.Exception.Message"
+            LogOutput $errorMessage
         }
     }
-    catch {
-        $errorMessage = $_.Exception.Message
-        Add-Content -Path "$rootDirectory\$logFile" -Value "Error processing file `"$currentFile`": $errorMessage"
+
+    # Add file info to list
+    $fileInfoList += $fileInfo
+
+    # Handle status update
+    $currentTime = Get-Date
+    if (($currentTime - $lastStatusUpdateTime).TotalSeconds -gt $statusUpdateIntervalSeconds) {
+        $statusMessage = "$($fileInfoList.Count) out of $totalFiles files processed..."
+        LogOutput $statusMessage
+        $lastStatusUpdateTime = Get-Date
+    }
+
+}
+
+# Preprocessing report
+$filesToRename = $fileInfoList.Where({!$_.IsSidecarFile -and !$_.IsDatePrefixed -and $_.DateTimeTakenIsValid}).Count
+$validSidecarFiles = $fileInfoList.Where({$_.IsSidecarFile -and $_.CorrespondingFileName}).Count
+$invalidSidecarFiles = $fileInfoList.Where({$_.IsSidecarFile -and !$_.CorrespondingFileName}).Count
+$preprocessingCompleteMessage = "Preprocessing complete. Total files: $totalFiles. Files to be renamed: $filesToRename. Files not to be renamed: $($totalFiles - $filesToRename). Valid .dop files: $validSidecarFiles. Invalid .dop files: $invalidSidecarFiles."
+LogOutput $preprocessingCompleteMessage
+
+
+# Rename files
+$fileCount = 0
+$renamedNonSidecarFiles = 0
+$renamedSidecarFiles = 0
+
+$fileInfoList | ForEach-Object {
+    # Rename non-sidecar files with a valid DateTimeTaken
+    if (!$_.IsSidecarFile -and !$_.IsDatePrefixed -and $_.DateTimeTakenIsValid) {
+        try {
+            $newName = $_.DateTimeTaken + "_" + $_.FileName + $_.FileExtension
+            Rename-Item -Path $_.FullPathName -NewName $newName
+            $_.IsDatePrefixed = $true
+            $renamedNonSidecarFiles++
+
+            # Rename corresponding sidecar file if there is one
+            if ($_.CorrespondingFileName) {
+                $correspondingFullPathName = $_.FullPathName.Replace($_.FileName + $_.FileExtension, $_.CorrespondingFileName)
+                $newCorrespondingName = $newName + ".dop"
+                Rename-Item -Path $correspondingFullPathName -NewName $newCorrespondingName
+                $fileInfoList.Where({$_.FullPathName -eq $correspondingFullPathName})[0].IsDatePrefixed = $true
+                $renamedSidecarFiles++
+            }
+        }
+        catch {
+            $errorMessage = "Error renaming file `"$_.FullPathName)`": $_.Exception.Message"
+            LogOutput $errorMessage
+        }
+    }
+
+    $fileCount++
+
+    # Status reporting
+    $currentTime = Get-Date
+    if (($currentTime - $lastStatusUpdateTime).TotalSeconds -gt $statusUpdateIntervalSeconds) {
+        $statusMessage = "$fileCount out of $totalFiles files processed..."
+        LogOutput $statusMessage
+        $lastStatusUpdateTime = Get-Date
     }
 }
 
-# Post-Processing
-$endMessages = @(
-    "Done.",
-    "Total files processed: $fileCount",
-    "Image files processed: $imageFileCount",
-    "Image files renamed: $imageFilesRenamed",
-    ".dop files processed: $dopFileCount",
-    ".dop files renamed: $dopFilesRenamed",
-    "Total files skipped: $skippedFileCount"
-)
+# Report the number of files renamed
+$renamingCompleteMessage = "Renaming complete. Non-DOP files renamed: $renamedNonSidecarFiles. DOP files renamed: $renamedSidecarFiles."
+LogOutput $renamingCompleteMessage
 
-# Write the post-processing messages to console and log file
-foreach ($message in $endMessages) {
-    Write-Output $message
-    Add-Content -Path "$rootDirectory\$logFile" -Value $message
+# Create deletion script for orphaned/non-corresponding DOP files
+if ($fileInfoList.Where({$_.IsSidecarFile -and !$_.CorrespondingFileName}).Count > 0) {
+    $fileInfoList.Where({$_.IsSidecarFile -and !$_.CorrespondingFileName}) | ForEach-Object {
+        Add-Content -Path "$rootDirectory\$deleteScriptFile" -Value "del `"$($_.FullPathName)`""
+    }
 }
+
+$fileInfoList | ConvertTo-Json | Out-File "$rootDirectory\fileInfoList.json"
+
+
+# Pause to allow user to read output
+Read-Host -Prompt "Press Enter to continue"
