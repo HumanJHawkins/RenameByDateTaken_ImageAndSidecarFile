@@ -1,10 +1,27 @@
-# Define a parameter block
-param (
-    [string]$rootDirectory = (New-Object -ComObject "Shell.Application").BrowseForFolder(0, "Select a folder", 0).Self.Path
-)
+# Load the required .NET assembly
+Add-Type -AssemblyName System.Windows.Forms
 
+# Create an instance of FolderBrowserDialog
+$startPath = "P:\01_Photo_Production\_TempRenameInProgress\"
+$folderBrowserDialog = New-Object -TypeName System.Windows.Forms.FolderBrowserDialog
+$folderBrowserDialog.SelectedPath = $startPath
+$folderBrowserDialog.Description = "Select a folder"
+
+# Show the folder selection dialog
+$dialogResult = $folderBrowserDialog.ShowDialog()
+
+# Dialog Result Processing
+# Check if the user clicked "OK" and get the selected path
+if ($dialogResult -eq [System.Windows.Forms.DialogResult]::OK) {
+    $rootDirectory = $folderBrowserDialog.SelectedPath
+}
+else {
+    exit
+}
+
+# User Input Validation
 # If user cancels the folder selection, exit the script
-if([string]::IsNullOrEmpty($rootDirectory)) {
+if ([string]::IsNullOrEmpty($rootDirectory)) {
     Write-Output "No folder selected, exiting..."
     exit
 }
@@ -14,54 +31,106 @@ $totalFiles = (Get-ChildItem -File -Recurse $rootDirectory | Measure-Object).Cou
 Write-Output "Directory to process: $rootDirectory"
 Write-Output "Total files to process: $totalFiles"
 
-# Create a new text file with the current date/time as its name
-$currentDateTime = Get-Date -Format "yyyyMMdd_HHmmss"
-$bulkRenameBatchFile = "$currentDateTime.txt"
-Add-Content -Path $bulkRenameBatchFile -Value "ECHO Begining List of files to rename."
-Write-Output "Generated script: $bulkRenameBatchFile"
-
-# Use ExifTool to generate the rename commands
+# Initialize variables
 $fileCount = 0
-$lastOutputTime = Get-Date
+$imageFileCount = 0
+$dopFileCount = 0
+$imageFilesRenamed = 0
+$dopFilesRenamed = 0
+$skippedFileCount = 0
+$currentTime = Get-Date
+$lastOutputTime = $currentTime
+$lastGcTime = $currentTime
+$logFile = "RenameLog_$($currentTime.ToString('yyyyMMdd_HHmmss')).txt"
+
+# Initialize log file
+Add-Content -Path "$rootDirectory\$logFile" -Value "Log file created at $currentTime"
+
+# Main Processing - Files Iteration
 Get-ChildItem -File -Recurse $rootDirectory | ForEach-Object {
-    # Convert file extension to lowercase
-    $newFileName = $_.BaseName + $_.Extension.ToLower()
-    Rename-Item -Path $_.FullName -NewName $newFileName
+    try {
+        $currentFile = $_.FullName
+        $currentFileName = $_.BaseName
+        $currentFileExtension = $_.Extension.ToLower()
 
-    $currentFile = $_.FullName.ToLower()
-    $currentFile = $currentFile -replace "'", "''" # Replace single quote with double single quotes
-    $currentFile = $currentFile -replace "_", "`_" # Replace underscore with escaped underscore
-    $currentFile = $currentFile -replace "\(", "`(" # Replace opening parenthesis with escaped opening parenthesis
-    $currentFile = $currentFile -replace "\)", "`)" # Replace closing parenthesis with escaped closing parenthesis
-    $currentFileName = $_.BaseName
-    $currentFileExtension = $_.Extension
+        # Pre-processing: File naming adjustments
+        if ($_.Extension -ne $currentFileExtension) {
+            Rename-Item -Path $currentFile -NewName ($_.BaseName + $currentFileExtension)
+        }
 
-    if($currentFileExtension -ne ".dop"){
-        $exiftoolOutput = & exiftool.exe -d "%Y%m%d_%H%M%S" -DateTimeOriginal $currentFile 2>$null
-        if(!$exiftoolOutput){
-            # Write-Output "Error reading DateTimeOriginal from $currentFile"
-        } else {
-            $currentFileDateTime = $exiftoolOutput.Split(":")[1].Trim()
-            if(!$currentFileDateTime){
-                # Write-Output "Error reading DateTimeOriginal from $currentFile"
-                continue
+        if ($currentFileName -like "IMG_*") {
+            $newFileName = $currentFileName -replace "^IMG_", ""
+            Rename-Item -Path $currentFile -NewName ($newFileName + $currentFileExtension)
+            $currentFileName = $newFileName
+        }
+
+        if ($currentFileExtension -ne ".dop") {
+            $exiftoolOutput = & exiftool.exe -d "%Y%m%d_%H%M%S" -DateTimeOriginal $currentFile 2>$null
+            if (!$exiftoolOutput) {
+                $skippedFileCount++
+                Add-Content -Path "$rootDirectory\$logFile" -Value "Skipped (ExifTool output not found): $currentFile"
+                throw "ExifTool output not found"
+            } else {
+                $currentFileDateTime = $exiftoolOutput.Split(":")[1].Trim()
+                if ($currentFileDateTime.Length -ne 15) {
+                    $skippedFileCount++
+                    Add-Content -Path "$rootDirectory\$logFile" -Value "Skipped (Invalid DateTime length): $currentFile"
+                    throw "Invalid DateTime length"
+                }
+
+                $currentFileDateHour = $currentFileDateTime.Substring(0,11)
+                if ($currentFileName -notlike "*$currentFileDateHour*") {
+                    $newFileNameWithExtension = "$currentFileDateTime" + "_" + $currentFileName + $currentFileExtension
+                    Rename-Item -Path $currentFile -NewName $newFileNameWithExtension
+                    $imageFilesRenamed++
+
+                    $dopFile = $currentFile + ".dop"
+                    if (Test-Path $dopFile) {
+                        $newDopFileName = "$currentFileDateTime" + "_" + $currentFileName + $currentFileExtension + ".dop"
+                        Rename-Item -Path $dopFile -NewName $newDopFileName
+                        $dopFilesRenamed++
+                    }
+                }
+                $imageFileCount++
+                Add-Content -Path "$rootDirectory\$logFile" -Value "Handled: $currentFile"
             }
-            $newFileNameWithExtension = "$currentFileDateTime" + "_" + $currentFileName + $currentFileExtension
-            $dopFile = $currentFile + ".dop"
-            Add-Content -Path $bulkRenameBatchFile -Value "ren `"$currentFile`" `"$newFileNameWithExtension`""
-            if(Test-Path $dopFile){
-                $fileCount++  # This is an extra file that is handled this loop.
-                Add-Content -Path $bulkRenameBatchFile -Value "ren `"$dopFile`" `"$newFileNameWithExtension.dop`""
+            $currentTime = Get-Date
+            if (($currentTime - $lastOutputTime).TotalSeconds -gt 3) {
+                $statusMessage = "$fileCount out of $totalFiles files processed..."
+                Write-Output $statusMessage
+                Add-Content -Path "$rootDirectory\$logFile" -Value $statusMessage
+                $lastOutputTime = Get-Date
             }
         }
-        
+        else {
+            $dopFileCount++
+            Add-Content -Path "$rootDirectory\$logFile" -Value "Not acted upon: $currentFile"
+        }
         $fileCount++
-        $currentTime = Get-Date
-        if(($currentTime - $lastOutputTime).TotalSeconds -gt 1){
-            Write-Output "$fileCount out of $totalFiles files processed..."
-            $lastOutputTime = Get-Date
+        if (($currentTime - $lastGcTime).TotalMinutes -gt 5) {
+            [GC]::Collect()
+            $lastGcTime = Get-Date
         }
+    }
+    catch {
+        $errorMessage = $_.Exception.Message
+        Add-Content -Path "$rootDirectory\$logFile" -Value "Error processing file `"$currentFile`": $errorMessage"
     }
 }
 
-Write-Output "Done."
+# Post-Processing
+$endMessages = @(
+    "Done.",
+    "Total files processed: $fileCount",
+    "Image files processed: $imageFileCount",
+    "Image files renamed: $imageFilesRenamed",
+    ".dop files processed: $dopFileCount",
+    ".dop files renamed: $dopFilesRenamed",
+    "Total files skipped: $skippedFileCount"
+)
+
+# Write the post-processing messages to console and log file
+foreach ($message in $endMessages) {
+    Write-Output $message
+    Add-Content -Path "$rootDirectory\$logFile" -Value $message
+}
