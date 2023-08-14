@@ -7,8 +7,35 @@ function LogOutput ($textToOutput) {
     Write-Output $textToOutput
 }
 
+function Rename-FileAndSidecar {
+    param (
+        [Parameter(Mandatory=$true)]
+        [string]$FilePathName,
+        
+        [Parameter(Mandatory=$true)]
+        [string]$RenameTo
+    )
+
+    # Ensure file exists
+    if (!(Test-Path -Path $FilePathName)) {
+        throw "File $FilePathName does not exist."
+    }
+
+    # Rename file
+    Rename-Item -Path $FilePathName -NewName $RenameTo
+
+    # Rename sidecar file if exists
+    if (Test-Path -Path ("$FilePathName.dop")) {
+        Rename-Item -Path ("$FilePathName.dop") -NewName ("$RenameTo.dop")
+        return 2   # 2 Files renamed
+    }
+
+    return 1   # 1 file renamed
+}
+
+
 # Get folder to operate on:
-$defaultPath = "P:\01_Photo_Production\_TempRenameInProgress\"
+$defaultPath = "P:\PhotoRenameTest\"
 $folderBrowserDialog = New-Object -TypeName System.Windows.Forms.FolderBrowserDialog
 $folderBrowserDialog.SelectedPath = $defaultPath
 $folderBrowserDialog.Description = "Select a folder"
@@ -25,7 +52,7 @@ $rootDirectory = $folderBrowserDialog.SelectedPath
 
 # Initialize variables and log file
 $totalFiles = (Get-ChildItem -Path $rootDirectory -File -Recurse).Count
-$statusUpdateIntervalSeconds = 5
+$statusUpdateInterval = 20
 
 $currentTime = Get-Date
 $lastStatusUpdateTime = $currentTime
@@ -38,7 +65,8 @@ LogOutput "Root directory selected: $rootDirectory"
 
 # Preprocess all files. Since we may be dealing with .dop sidecar
 #  files that need to be kept in sync, analyze everything first. 
-$fileInfoList = @()
+$fileInfoList = New-Object System.Collections.Generic.List[object]
+$statusCounter = 0
 Get-ChildItem -Path $rootDirectory -File -Recurse | Where-Object { $_.FullName -ne "$rootDirectory\$logFile" } | ForEach-Object {
     # Store file information
     $fileBaseName = $_.BaseName
@@ -85,8 +113,7 @@ Get-ChildItem -Path $rootDirectory -File -Recurse | Where-Object { $_.FullName -
                 }
             } else {
                 # Log if no exif data found
-                $logMessage = "No DateTimeTaken found for `"$($_.FullName)`""
-                LogOutput $logMessage
+                # LogOutput "No DateTimeTaken found for `"$($_.FullName)`""
             }
         }
         catch {
@@ -96,20 +123,19 @@ Get-ChildItem -Path $rootDirectory -File -Recurse | Where-Object { $_.FullName -
     }
 
     # Add file info to list
-    $fileInfoList += $fileInfo
+    $fileInfoList.Add($fileInfo)
 
     # Handle status update
-    $currentTime = Get-Date
-    if (($currentTime - $lastStatusUpdateTime).TotalSeconds -gt $statusUpdateIntervalSeconds) {
-        $statusMessage = "$($fileInfoList.Count) out of $totalFiles files processed..."
-        LogOutput $statusMessage
-        $lastStatusUpdateTime = Get-Date
+    $statusCounter++
+    if ($statusCounter -gt $statusUpdateInterval) {
+        LogOutput "$($fileInfoList.Count) out of $totalFiles files processed..."
+        $statusCounter = 0
     }
 }
 
 # Second loop through $fileInfoList to update $filenameAlreadyValid
 # TO DO: Clean up some filenames here... Remove "IMG_", move existing datestamp to the front of name?
-$validImageFiles = @()  # Initialize array to hold the names of valid images that don't start with a datestamp
+$statusCounter = 0
 $fileInfoList | ForEach-Object {
     if ($_.DateTimeTakenIsValid) {
         # Extract the full DateTimeTaken and the date with 2-digit year from DateTimeTaken
@@ -119,12 +145,14 @@ $fileInfoList | ForEach-Object {
         # Check if the FileName contains the date with 2-digit year and update $filenameAlreadyValid
         if ($_.FileName -match $date) {
             $_.FilenameAlreadyValid = $true
-
-            # If the FileName doesn't start with the full DateTimeTaken, add it to $validImageFiles list
-            if ($_.FileName -notmatch "^$dateTime") {
-                $validImageFiles += $_.FileName
-            }
         }
+    }
+    
+    # Handle status update
+    $statusCounter++
+    if ($statusCounter -gt $statusUpdateInterval) {
+        LogOutput "Loop 2: $($fileInfoList.Count) out of $totalFiles files processed..."
+        $statusCounter = 0
     }
 }
 
@@ -149,16 +177,12 @@ $fileInfoList | ForEach-Object {
     if (!$_.IsSidecarFile -and !$_.FilenameAlreadyValid -and $_.DateTimeTakenIsValid) {
         try {
             $newName = $_.DateTimeTaken + "_" + $_.FileName
-            Rename-Item -Path $_.FullPathName -NewName $newName
+            $renamedFileCount = Rename-FileAndSidecar $_.FullPathName $newName
             $_.Renamed = $true
             $renamedNonSidecarFiles++
 
-            # Rename corresponding sidecar file if there is one
-            if ($_.CorrespondingFileName) {
-                $correspondingFullPathName = $_.FullPathName.Replace($_.FileName, $_.CorrespondingFileName)
-                $newCorrespondingName = $newName + ".dop"
-                Rename-Item -Path $correspondingFullPathName -NewName $newCorrespondingName
-                $fileInfoList.Where({$_.FullPathName -eq $correspondingFullPathName})[0].Renamed = $true
+            if($renamedFileCount -eq 2) {
+                # $fileInfoList.Where({$_.FullPathName -eq $correspondingFullPathName})[0].Renamed = $true
                 $renamedSidecarFiles++
             }
         }
@@ -185,15 +209,15 @@ LogOutput "Renaming complete."
 LogOutput "Non-DOP files renamed: $renamedNonSidecarFiles"
 LogOutput "DOP files renamed: $renamedSidecarFiles"
 
-# Output a list of valid image files that were not in out intended format.
-# This is for analysis to improve the renaming. Can be removed later.
-if ($validImageFiles.Count -gt 0) {
-    $logMessage = "These valid files do not start with the DateTimeTaken date:"
-    LogOutput $logMessage
 
-    $validImageFiles | ForEach-Object {
-        LogOutput $_
+# Create list for already valid but nonconforming files
+$validNonconformingFiles = $fileInfoList.Where({$_.FilenameAlreadyValid -and $_.DateTimeTakenIsValid -and $_.FileName -notmatch "^$($_.DateTimeTaken)"})
+if ($validNonconformingFiles.Count -gt 0) {
+    $listFile = "ValidNonconformingFiles_$($currentTime.ToString('yyyyMMdd_HHmmss')).txt"
+    $validNonconformingFiles | ForEach-Object {
+        Add-Content -Path "$rootDirectory\$listFile" -Value $_.FileName
     }
+    LogOutput "List of valid but nonconforming files created at: $rootDirectory\$listFile"
 }
 
 
