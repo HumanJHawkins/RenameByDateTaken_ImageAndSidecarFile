@@ -23,11 +23,7 @@ if (!($folderBrowserDialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]:
 
 $rootDirectory = $folderBrowserDialog.SelectedPath
 
-# Initialize log file and variables
-LogOutput "Log file created at $currentTime"
-LogOutput "Root directory selected: $rootDirectory"
-
-
+# Initialize variables and log file
 $totalFiles = (Get-ChildItem -Path $rootDirectory -File -Recurse).Count
 $statusUpdateIntervalSeconds = 5
 
@@ -36,38 +32,39 @@ $lastStatusUpdateTime = $currentTime
 $logFile = "RenameLog_$($currentTime.ToString('yyyyMMdd_HHmmss')).txt"
 $deleteScriptFile = "DeleteOrphanedDOPs_$($currentTime.ToString('yyyyMMdd_HHmmss')).txt"
 
+LogOutput "Log file created at $currentTime"
+LogOutput "Root directory selected: $rootDirectory"
+
 
 # Preprocess all files. Since we may be dealing with .dop sidecar
 #  files that need to be kept in sync, analyze everything first. 
 $fileInfoList = @()
-Get-ChildItem -Path $rootDirectory -File -Recurse | ForEach-Object {
+Get-ChildItem -Path $rootDirectory -File -Recurse | Where-Object { $_.FullName -ne "$rootDirectory\$logFile" } | ForEach-Object {
     # Store file information
-    $fileName = $_.BaseName
+    $fileBaseName = $_.BaseName
     $fileExtension = $_.Extension
-    $isDatePrefixed = $fileName -match '^\d{8}_\d{2}_'
+    $filenameAlreadyValid = $false  # Default to False, this will be updated later in the second loop
 
     # Presume the usual corresponding filename. If not actually present, revert to null.
     $correspondingFileName = if ($fileExtension -eq ".dop") { 
         # Remove only the last occurrence of .dop
-        $fileName -replace '\.dop$', ''
+        $fileBaseName -replace '\.dop$', ''
     } else {
-        $fileName + $fileExtension + ".dop"
+        $fileBaseName + $fileExtension + ".dop"
     }
 
     if(!(Test-Path -Path "$($_.DirectoryName)\$correspondingFileName")) {
         $correspondingFileName = $null
     }
 
-
     $fileInfo = New-Object -TypeName PSObject -Property @{
         FullPathName = $_.FullName
-        FileName = $fileName
-        FileExtension = $fileExtension
+        FileName = $fileBaseName + $fileExtension
         IsSidecarFile = $fileExtension -eq ".dop"
         DateTimeTaken = $null
         DateTimeTakenIsValid = $false
-        IsDatePrefixed = $isDatePrefixed
-        FilenameAlreadyValid = $isDatePrefixed
+        Renamed = $false
+        FilenameAlreadyValid = $filenameAlreadyValid
         CorrespondingFileName = $correspondingFileName
     }
 
@@ -108,15 +105,38 @@ Get-ChildItem -Path $rootDirectory -File -Recurse | ForEach-Object {
         LogOutput $statusMessage
         $lastStatusUpdateTime = Get-Date
     }
-
 }
 
+# Second loop through $fileInfoList to update $filenameAlreadyValid
+# TO DO: Clean up some filenames here... Remove "IMG_", move existing datestamp to the front of name?
+$validImageFiles = @()  # Initialize array to hold the names of valid images that don't start with a datestamp
+$fileInfoList | ForEach-Object {
+    if ($_.DateTimeTakenIsValid) {
+        # Extract the full DateTimeTaken and the date with 2-digit year from DateTimeTaken
+        $dateTime = $_.DateTimeTaken
+        $date = $_.DateTimeTaken.substring(2, 6)
+
+        # Check if the FileName contains the date with 2-digit year and update $filenameAlreadyValid
+        if ($_.FileName -match $date) {
+            $_.FilenameAlreadyValid = $true
+
+            # If the FileName doesn't start with the full DateTimeTaken, add it to $validImageFiles list
+            if ($_.FileName -notmatch "^$dateTime") {
+                $validImageFiles += $_.FileName
+            }
+        }
+    }
+}
+
+
 # Preprocessing report
-$filesToRename = $fileInfoList.Where({!$_.IsSidecarFile -and !$_.IsDatePrefixed -and $_.DateTimeTakenIsValid}).Count
-$validSidecarFiles = $fileInfoList.Where({$_.IsSidecarFile -and $_.CorrespondingFileName}).Count
-$invalidSidecarFiles = $fileInfoList.Where({$_.IsSidecarFile -and !$_.CorrespondingFileName}).Count
-$preprocessingCompleteMessage = "Preprocessing complete. Total files: $totalFiles. Files to be renamed: $filesToRename. Files not to be renamed: $($totalFiles - $filesToRename). Valid .dop files: $validSidecarFiles. Invalid .dop files: $invalidSidecarFiles."
-LogOutput $preprocessingCompleteMessage
+LogOutput "Preprocessing complete."
+LogOutput "Total files: $totalFiles"
+LogOutput "Files to be renamed: $($fileInfoList.Where({!$_.IsSidecarFile -and !$_.FilenameAlreadyValid -and $_.DateTimeTakenIsValid}).Count)"
+$filesToRename = $fileInfoList.Where({!$_.IsSidecarFile -and !$_.FilenameAlreadyValid -and $_.DateTimeTakenIsValid}).Count
+LogOutput "Files not to be renamed: $($totalFiles - $filesToRename)"
+LogOutput "Valid .dop files: $($fileInfoList.Where({$_.IsSidecarFile -and $_.CorrespondingFileName}).Count)"
+LogOutput "Invalid .dop files: $($fileInfoList.Where({$_.IsSidecarFile -and !$_.CorrespondingFileName}).Count)"
 
 
 # Rename files
@@ -126,19 +146,19 @@ $renamedSidecarFiles = 0
 
 $fileInfoList | ForEach-Object {
     # Rename non-sidecar files with a valid DateTimeTaken
-    if (!$_.IsSidecarFile -and !$_.IsDatePrefixed -and $_.DateTimeTakenIsValid) {
+    if (!$_.IsSidecarFile -and !$_.FilenameAlreadyValid -and $_.DateTimeTakenIsValid) {
         try {
-            $newName = $_.DateTimeTaken + "_" + $_.FileName + $_.FileExtension
+            $newName = $_.DateTimeTaken + "_" + $_.FileName
             Rename-Item -Path $_.FullPathName -NewName $newName
-            $_.IsDatePrefixed = $true
+            $_.Renamed = $true
             $renamedNonSidecarFiles++
 
             # Rename corresponding sidecar file if there is one
             if ($_.CorrespondingFileName) {
-                $correspondingFullPathName = $_.FullPathName.Replace($_.FileName + $_.FileExtension, $_.CorrespondingFileName)
+                $correspondingFullPathName = $_.FullPathName.Replace($_.FileName, $_.CorrespondingFileName)
                 $newCorrespondingName = $newName + ".dop"
                 Rename-Item -Path $correspondingFullPathName -NewName $newCorrespondingName
-                $fileInfoList.Where({$_.FullPathName -eq $correspondingFullPathName})[0].IsDatePrefixed = $true
+                $fileInfoList.Where({$_.FullPathName -eq $correspondingFullPathName})[0].Renamed = $true
                 $renamedSidecarFiles++
             }
         }
@@ -159,18 +179,35 @@ $fileInfoList | ForEach-Object {
     }
 }
 
-# Report the number of files renamed
-$renamingCompleteMessage = "Renaming complete. Non-DOP files renamed: $renamedNonSidecarFiles. DOP files renamed: $renamedSidecarFiles."
-LogOutput $renamingCompleteMessage
 
-# Create deletion script for orphaned/non-corresponding DOP files
-if ($fileInfoList.Where({$_.IsSidecarFile -and !$_.CorrespondingFileName}).Count > 0) {
-    $fileInfoList.Where({$_.IsSidecarFile -and !$_.CorrespondingFileName}) | ForEach-Object {
-        Add-Content -Path "$rootDirectory\$deleteScriptFile" -Value "del `"$($_.FullPathName)`""
+# Report the number of files renamed
+LogOutput "Renaming complete."
+LogOutput "Non-DOP files renamed: $renamedNonSidecarFiles"
+LogOutput "DOP files renamed: $renamedSidecarFiles"
+
+# Output a list of valid image files that were not in out intended format.
+# This is for analysis to improve the renaming. Can be removed later.
+if ($validImageFiles.Count -gt 0) {
+    $logMessage = "These valid files do not start with the DateTimeTaken date:"
+    LogOutput $logMessage
+
+    $validImageFiles | ForEach-Object {
+        LogOutput $_
     }
 }
 
+
+# Create deletion script for orphaned/non-corresponding DOP files
+if ($fileInfoList.Where({$_.IsSidecarFile -and !$_.CorrespondingFileName}).Count -gt 0) {
+    $fileInfoList.Where({$_.IsSidecarFile -and !$_.CorrespondingFileName}) | ForEach-Object {
+        Add-Content -Path "$rootDirectory\$deleteScriptFile" -Value "del `"$($_.FullPathName)`""
+    }
+    LogOutput "Deletion script for orphaned sidecar files created at: $rootDirectory\$deleteScriptFile"
+}
+
+
 $fileInfoList | ConvertTo-Json | Out-File "$rootDirectory\fileInfoList.json"
+LogOutput "File data saved to: $rootDirectory\fileInfoList.json"
 
 
 # Pause to allow user to read output
